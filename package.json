@@ -1,0 +1,27 @@
+{
+  "name": "mbu-finalysis",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Domain-agnostic, browser-based financial/data analytics workspace — upload any spreadsheet and get dashboards, forecasts, drill-through, and comparisons automatically.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "build:css": "tailwindcss -i ./src/tw.css -o ./src/tw-built.css --minify"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "lucide-react": "^0.400.0",
+    "papaparse": "^5.7.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.15.4",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.19",
+    "vite": "^5.4.21",
+    "vite-plugin-singlefile": "^2.3.3"
+  }
+}
