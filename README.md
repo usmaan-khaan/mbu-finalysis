@@ -1,6 +1,6 @@
 # MBU Finalysis
 
-A domain-agnostic, browser-based financial/data analytics workspace. Upload any spreadsheet — sales, stock prices, expenses, whatever — and it auto-detects your metrics, categories, and dates, then builds a full dashboard: KPIs, breakdowns, trends, forecasts, comparisons, and pattern-detection insights. No backend, no setup, no account. Everything runs client-side in your browser.
+A domain-agnostic, browser-based financial/data analytics workspace. Upload a spreadsheet, review detected column names and types, then explore KPIs, breakdowns, trends, forecasts, comparisons, and pattern-detection insights. No backend or account is needed. Analysis runs in your browser.
 
 **[Live demo](https://claude.ai/artifact/NpRZvwbCbPvqSDbnH1csj8)**
 
@@ -14,7 +14,7 @@ A domain-agnostic, browser-based financial/data analytics workspace. Upload any 
 
 **Trends** — line or area charts over time for every active metric, with the ability to hide/show individual series and a brush control to zoom into a date range.
 
-**Forecast** — growth scenarios (conservative/base/aggressive, or a custom rate) projected from your own historical trend, goal-seek ("what growth rate do I need to hit X by date Y"), and a sensitivity grid that varies two assumptions of a calculated metric at once.
+**Forecast** — growth scenarios (conservative/base/aggressive, or a custom rate) projected from your own historical trend, goal-seek ("what growth rate do I need to hit X by date Y"), and a sensitivity grid that varies two assumptions of a calculated metric at once. A rolling one-month backtest reports historical error when enough consecutive observations exist. Scenarios are illustrative, especially with short or irregular histories.
 
 **Insights** — fully offline pattern detection: strengths and pain points per dimension, correlations between numeric fields, statistical outlier detection, configurable threshold alerts, and a data quality report (duplicates, missing values, unparseable dates, negative values). See [AI features](#ai-features-optional) below for the two features that need a live API call.
 
@@ -26,6 +26,8 @@ A domain-agnostic, browser-based financial/data analytics workspace. Upload any 
 ![Drill-through filtering](docs/screenshots/drillthrough.png)
 
 Every configuration (which metrics/dimensions are on, custom calculated metrics, budget-vs-actual pairs, saved views) can be remembered per file-shape via `localStorage`, so re-uploading a similarly-shaped file restores your setup automatically.
+
+The import review lets you rename columns and choose number, date, or category handling, including day-first or month-first dates. Numbers with common currency symbols, thousands separators, parentheses, and percent signs are parsed; the preview counts values that cannot be parsed before you proceed. Each metric can use a sum, average, count of nonblank values, minimum, or maximum. CSV exports neutralize spreadsheet formulas in text cells.
 
 ## Getting started
 
@@ -42,7 +44,9 @@ Open the printed local URL and drop in a CSV, TSV, JSON, or Excel (`.xlsx`/`.xls
 npm run build
 ```
 
-This produces a single self-contained `dist/index.html` (via [`vite-plugin-singlefile`](https://github.com/richardtallent/vite-plugin-singlefile)) — every script and style inlined, no separate assets. You can drop that one file anywhere and it works: GitHub Pages, a static file host, even a local double-click.
+Run the calculation regression tests with `npm test`. The GitHub Pages workflow runs tests before building.
+
+This produces a single self-contained `dist/index.html`; the build script inlines Vite's generated script and stylesheet. You can drop that file on GitHub Pages, a static file host, or open it locally.
 
 ### Deploying to GitHub Pages
 
@@ -66,19 +70,16 @@ If you want these two working for real, you'll need your own lightweight backend
 
 ## Tech stack
 
-- [React 18](https://react.dev/) + [Vite 5](https://vitejs.dev/)
+- [React 18](https://react.dev/) + [Vite 8](https://vite.dev/)
 - [Recharts](https://recharts.org/) for charts
 - [PapaParse](https://www.papaparse.com/) (CSV/TSV) and [SheetJS](https://sheetjs.com/) (Excel) for parsing
-- [Tailwind CSS](https://tailwindcss.com/) (pre-built utility file checked in — see below) + inline styles
+- SheetJS is installed from its [official distribution](https://docs.sheetjs.com/docs/getting-started/installation/frameworks/) because the npm registry package is outdated.
+- A small responsive stylesheet in `src/tw-built.css` plus inline styles
 - [Lucide](https://lucide.dev/) icons
 
-### Regenerating the Tailwind build
+### Styling
 
-Only a handful of Tailwind utility classes (mostly responsive grid/flex helpers) are used, pre-built once into `src/tw-built.css` and checked into the repo — there's no Tailwind step in the normal build. If you add new Tailwind classes to `src/App.jsx`, regenerate it with:
-
-```bash
-npm run build:css
-```
+The few responsive grid and visibility classes used by the app are defined directly in `src/tw-built.css`. Add new class rules there when adding responsive layouts.
 
 ## Project structure
 
@@ -87,10 +88,10 @@ npm run build:css
 ├── src/
 │   ├── main.jsx        # entry point — mounts the app, localStorage shim
 │   ├── App.jsx          # the entire application (single component file)
-│   ├── tw.css            # Tailwind directives (source)
-│   └── tw-built.css      # pre-built Tailwind output (checked in, see above)
+│   └── tw-built.css      # small responsive stylesheet
 ├── vite.config.js
-├── tailwind.config.js
+├── scripts/inline-build.mjs
+├── tests/analysis.test.cjs
 └── docs/screenshots/
 ```
 

@@ -92,17 +92,68 @@ function kpiLabel(key) {
 // already look like a real date.
 const DATE_LIKE_PATTERN = /^\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$|^\d{1,2}\/\d{1,2}\/\d{2,4}$|^\d{1,2}-\d{1,2}-\d{2,4}$|^\d{4}\/\d{1,2}\/\d{1,2}$|^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}$/i;
 
+export function parseNumericValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  let text = value.trim();
+  if (!text) return null;
+  const negative = /^\(.*\)$/.test(text);
+  if (negative) text = text.slice(1, -1).trim();
+  const percent = text.endsWith('%');
+  text = text.replace(/^[\$£€₹]\s*/, '').replace(/\s*[\$£€₹%]$/, '');
+  if (!/^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$/.test(text)) return null;
+  const parsed = Number(text.replace(/,/g, ''));
+  return Number.isFinite(parsed) ? (negative ? -parsed : parsed) / (percent ? 100 : 1) : null;
+}
+
+export function parseDateValue(value, format = 'mdy') {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
+  if (typeof value !== 'string' || !DATE_LIKE_PATTERN.test(value.trim())) return null;
+  const text = value.trim();
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:$|[ T])/.exec(text);
+  if (iso) {
+    const [, year, month, day] = iso.map(Number);
+    const check = new Date(Date.UTC(year, month - 1, day));
+    if (check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) return null;
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  const yearFirst = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(text);
+  const separated = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/.exec(text);
+  if (yearFirst || separated) {
+    let year, month, day;
+    if (yearFirst) [, year, month, day] = yearFirst.map(Number);
+    else {
+      const first = Number(separated[1]), second = Number(separated[2]);
+      year = Number(separated[3]);
+      if (year < 100) year += 2000;
+      month = format === 'dmy' ? second : first;
+      day = format === 'dmy' ? first : second;
+    }
+    const check = new Date(Date.UTC(year, month - 1, day));
+    if (check.getUTCFullYear() !== year || check.getUTCMonth() + 1 !== month || check.getUTCDate() !== day) return null;
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+}
+
+export function normalizeRows(rows, columnTypes) {
+  return rows.map(row => Object.fromEntries(Object.entries(row).map(([key, value]) => {
+    const type = columnTypes[key];
+    if (type === 'number') return [key, parseNumericValue(value)];
+    if (type === 'date' || type === 'date-dmy') return [key, parseDateValue(value, type === 'date-dmy' ? 'dmy' : 'mdy')];
+    return [key, value];
+  })));
+}
+
 // Classify each column as number / date / category / text(high-cardinality, excluded by default)
 export function detectSchema(rows, fields) {
   return fields.map(f => {
     const raw = rows.map(r => r[f]).filter(v => v !== null && v !== undefined && v !== '');
     const total = raw.length || 1;
-    const numericCount = raw.filter(v => typeof v === 'number' && isFinite(v)).length;
+    const numericCount = raw.filter(v => parseNumericValue(v) !== null).length;
     const dateCount = raw.filter(v => {
-      if (typeof v !== 'string') return false;
-      const s = v.trim();
-      if (!DATE_LIKE_PATTERN.test(s)) return false;
-      return !isNaN(Date.parse(s));
+      return parseDateValue(v) !== null;
     }).length;
     const uniqueVals = new Set(raw.map(v => String(v)));
     let type = 'category';
@@ -115,9 +166,15 @@ export function detectSchema(rows, fields) {
 
 export function aggregateMetrics(rows, metricKeys) {
   const out = { count: rows.length };
-  metricKeys.forEach(k => {
-    const vals = rows.map(r => Number(r[k])).filter(v => !isNaN(v));
-    out[k] = vals.reduce((a, b) => a + b, 0);
+  metricKeys.forEach(metric => {
+    const k = typeof metric === 'string' ? metric : metric.key;
+    const aggregation = typeof metric === 'string' ? 'sum' : (metric.aggregation || 'sum');
+    const vals = rows.map(r => parseNumericValue(r[k])).filter(v => v !== null);
+    const sum = vals.reduce((a, b) => a + b, 0);
+    out[k] = aggregation === 'count' ? vals.length :
+      aggregation === 'average' ? (vals.length ? sum / vals.length : 0) :
+      aggregation === 'min' ? (vals.length ? vals.reduce((a, b) => Math.min(a, b)) : 0) :
+      aggregation === 'max' ? (vals.length ? vals.reduce((a, b) => Math.max(a, b)) : 0) : sum;
   });
   return out;
 }
@@ -146,14 +203,15 @@ export function computeCalc(rows, calc) {
 export const computeRatio = computeCalc;
 
 export function groupByGeneric(rows, dimKey, metricKeys, ratios) {
-  const groups = {};
+  const groups = new Map();
   rows.forEach(r => {
     const raw = r[dimKey];
     const k = (raw === null || raw === undefined || raw === '') ? '(blank)' : String(raw);
-    (groups[k] = groups[k] || []).push(r);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
   });
-  return Object.keys(groups).sort().map(k => {
-    const subset = groups[k];
+  return Array.from(groups.keys()).sort().map(k => {
+    const subset = groups.get(k);
     const agg = aggregateMetrics(subset, metricKeys);
     const ratioVals = {};
     (ratios || []).forEach(rt => { ratioVals[rt.key] = computeRatio(subset, rt); });
@@ -163,10 +221,9 @@ export function groupByGeneric(rows, dimKey, metricKeys, ratios) {
 
 export function monthlyGroupGeneric(rows, dateKey, metricKeys, ratios) {
   const withMonth = rows.map(r => {
-    const t = Date.parse(r[dateKey]);
-    if (isNaN(t)) return null;
-    const d = new Date(t);
-    const m = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+    const date = parseDateValue(r[dateKey]);
+    if (!date) return null;
+    const m = date.slice(0, 7);
     return { ...r, __month: m };
   }).filter(Boolean);
   const months = Array.from(new Set(withMonth.map(r => r.__month))).sort();
@@ -184,7 +241,11 @@ export function computeAvgGrowth(trend, key) {
   const rates = [];
   for (let i = 1; i < trend.length; i++) {
     const prev = trend[i - 1][key], cur = trend[i][key];
-    if (prev) rates.push((cur - prev) / Math.abs(prev));
+    const previousMonth = trend[i - 1].month, currentMonth = trend[i].month;
+    const months = previousMonth && currentMonth ?
+      (Number(currentMonth.slice(0, 4)) - Number(previousMonth.slice(0, 4))) * 12 +
+      Number(currentMonth.slice(5, 7)) - Number(previousMonth.slice(5, 7)) : 1;
+    if (prev > 0 && cur > 0 && months > 0) rates.push(Math.pow(cur / prev, 1 / months) - 1);
   }
   if (!rates.length) return 0;
   const avg = rates.reduce((a, b) => a + b, 0) / rates.length;
@@ -197,6 +258,19 @@ export function projectGeneric(baseValue, monthlyGrowth, labels) {
     v = v * (1 + monthlyGrowth);
     return { label, value: v };
   });
+}
+
+export function backtestForecast(trend, key) {
+  const errors = [];
+  for (let i = 3; i < trend.length; i++) {
+    const current = trend[i], previous = trend[i - 1];
+    const expectedMonth = new Date(Date.UTC(Number(previous.month.slice(0, 4)), Number(previous.month.slice(5, 7)), 1)).toISOString().slice(0, 7);
+    if (current.month !== expectedMonth || current[key] <= 0) continue;
+    const history = trend.slice(Math.max(0, i - 6), i);
+    const projected = previous[key] * (1 + computeAvgGrowth(history, key));
+    errors.push(Math.abs(projected - current[key]) / Math.abs(current[key]));
+  }
+  return errors.length ? { samples: errors.length, meanAbsolutePercentError: errors.reduce((a, b) => a + b, 0) / errors.length } : null;
 }
 
 /* ===================== Rule-based insight engine (instant, no API) ===================== */
@@ -283,7 +357,9 @@ export function computeInsights(input) {
 /* ===================== Export helpers ===================== */
 export function csvEscape(v) {
   if (v === null || v === undefined) return '';
-  const s = String(v);
+  // Spreadsheet applications can evaluate formulas in imported CSV cells.
+  const raw = String(v);
+  const s = /^[\s\u0000-\u001f]*[=+@\-]/.test(raw) && typeof v === 'string' ? "'" + raw : raw;
   if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
 }
@@ -340,7 +416,7 @@ export function computeCorrelations(rows, keys) {
   const out = [];
   for (let i = 0; i < keys.length; i++) {
     for (let j = i + 1; j < keys.length; j++) {
-      const pairs = rows.map(r => [Number(r[keys[i]]), Number(r[keys[j]])]).filter(p => !isNaN(p[0]) && !isNaN(p[1]));
+      const pairs = rows.map(r => [parseNumericValue(r[keys[i]]), parseNumericValue(r[keys[j]])]).filter(p => p[0] !== null && p[1] !== null);
       if (pairs.length < 5) continue;
       out.push({ a: keys[i], b: keys[j], r: pearson(pairs.map(p => p[0]), pairs.map(p => p[1])), n: pairs.length });
     }
@@ -356,7 +432,7 @@ export function corrStrength(r) {
 }
 export function computeOutliers(rows, key, zThresh) {
   const zt = zThresh || 2.5;
-  const vals = rows.map(r => Number(r[key])).filter(v => !isNaN(v));
+  const vals = rows.map(r => parseNumericValue(r[key])).filter(v => v !== null);
   const n = vals.length;
   if (n < 6) return [];
   const mean = vals.reduce((a, b) => a + b, 0) / n;
@@ -365,8 +441,8 @@ export function computeOutliers(rows, key, zThresh) {
   if (!sd) return [];
   const out = [];
   rows.forEach((r) => {
-    const v = Number(r[key]);
-    if (isNaN(v)) return;
+    const v = parseNumericValue(r[key]);
+    if (v === null) return;
     const z = (v - mean) / sd;
     if (Math.abs(z) >= zt) out.push({ value: v, z, row: r });
   });
@@ -379,14 +455,21 @@ export function computeOutliers(rows, key, zThresh) {
 // ("year over year") — both use the same monthly trend array, just indexed
 // further back, so one function covers both modes.
 export function periodDelta(trend, key, offset = 1) {
-  if (!trend || trend.length < offset + 1) return null;
-  const cur = trend[trend.length - 1], prev = trend[trend.length - 1 - offset];
+  if (!trend || trend.length < 2) return null;
+  const cur = trend[trend.length - 1];
+  const [year, month] = cur.month.split('-').map(Number);
+  const target = new Date(Date.UTC(year, month - 1 - offset, 1)).toISOString().slice(0, 7);
+  const prev = trend.find(item => item.month === target);
+  if (!prev) return null;
   const pct = prev[key] !== 0 ? (cur[key] - prev[key]) / Math.abs(prev[key]) : 0;
   return { curLabel: cur.label, prevLabel: prev.label, cur: cur[key], prev: prev[key], pct };
 }
 
 /* ===================== Saved-setup persistence (window.storage) ===================== */
 export function schemaSignature(fields) {
+  return JSON.stringify(fields.slice().sort());
+}
+function legacySchemaSignature(fields) {
   return fields.slice().sort().join('|').toLowerCase().slice(0, 150);
 }
 export async function loadSavedConfig(fields) {
@@ -394,6 +477,19 @@ export async function loadSavedConfig(fields) {
   try {
     const res = await window.storage.get('mbu_config:' + schemaSignature(fields), false);
     if (res && res.value) return JSON.parse(res.value);
+    const old = await window.storage.get('mbu_config:' + legacySchemaSignature(fields), false);
+    if (old && old.value) {
+      const config = JSON.parse(old.value);
+      const savedFields = new Set([
+        ...(config.metrics || []).map(metric => metric.key),
+        ...(config.dimensions || []).map(dimension => dimension.key),
+        ...(config.dateField ? [config.dateField] : []),
+      ]);
+      if (savedFields.size === fields.length && fields.every(field => savedFields.has(field))) {
+        await saveConfig(fields, config);
+        return config;
+      }
+    }
   } catch (e) { /* no saved config for this shape yet, or storage unavailable */ }
   return null;
 }
@@ -404,6 +500,7 @@ export async function saveConfig(fields, config) {
 export async function deleteSavedConfig(fields) {
   if (typeof window === 'undefined' || !window.storage) return;
   try { await window.storage.delete('mbu_config:' + schemaSignature(fields), false); } catch (e) { /* nothing to delete */ }
+  try { await window.storage.delete('mbu_config:' + legacySchemaSignature(fields), false); } catch (e) { /* nothing to delete */ }
 }
 
 /* ===================== Saved views (named filter/breakdown presets) ===================== */
@@ -412,6 +509,14 @@ export async function loadSavedViews(fields) {
   try {
     const res = await window.storage.get('mbu_views:' + schemaSignature(fields), false);
     if (res && res.value) return JSON.parse(res.value);
+    const old = await window.storage.get('mbu_views:' + legacySchemaSignature(fields), false);
+    if (old && old.value) {
+      const views = JSON.parse(old.value);
+      if (Array.isArray(views)) {
+        await saveViewsList(fields, views);
+        return views;
+      }
+    }
   } catch (e) { /* none saved yet, or storage unavailable */ }
   return [];
 }
@@ -449,7 +554,7 @@ export function computeDataQuality(rows, fields, dateField) {
     badDateCount = rows.filter(r => {
       const v = r[dateField];
       if (v === null || v === undefined || v === '') return false;
-      return isNaN(Date.parse(v));
+      return parseDateValue(v) === null;
     }).length;
   }
 
@@ -762,7 +867,7 @@ function nextMonths(lastMonthStr, n) {
 }
 
 function ConfigPanel(props) {
-  const { dataset, open, onToggleOpen, onToggleMetric, onSetMetricFormat, onToggleDimension, onSetDateField, onAddRatio, onUpdateRatio, onRemoveRatio, onSwitchSheet, onSaveConfig, onForgetConfig, saveStatus, savedConfigApplied, onAddBudgetPair, onUpdateBudgetPair, onRemoveBudgetPair } = props;
+  const { dataset, open, onToggleOpen, onToggleMetric, onSetMetricFormat, onSetAggregation, onToggleDimension, onSetDateField, onAddRatio, onUpdateRatio, onRemoveRatio, onSwitchSheet, onSaveConfig, onForgetConfig, saveStatus, savedConfigApplied, onAddBudgetPair, onUpdateBudgetPair, onRemoveBudgetPair } = props;
   const dateCandidates = dataset.schema.filter(s => s.type === 'date');
   const otherCols = dataset.schema.filter(s => s.type !== 'date');
   const sheetNames = dataset.sheets ? Object.keys(dataset.sheets) : [];
@@ -807,6 +912,9 @@ function ConfigPanel(props) {
                 <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 6, border: `1px solid ${m.on ? COLORS.accent : COLORS.border}`, borderRadius: 8, padding: '6px 10px', background: m.on ? COLORS.accentSoft : '#FFFFFF' }}>
                   <input type="checkbox" checked={m.on} onChange={() => onToggleMetric(m.key)} />
                   <span style={{ fontFamily: SANS, fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>{m.key}</span>
+                  {m.on ? <select aria-label={`${m.key} aggregation`} value={m.aggregation || 'sum'} onChange={e => onSetAggregation(m.key, e.target.value)} style={{ fontFamily: SANS, fontSize: 11, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '2px 4px' }}>
+                    <option value="sum">Sum</option><option value="average">Average</option><option value="count">Count values</option><option value="min">Minimum</option><option value="max">Maximum</option>
+                  </select> : null}
                   {m.on ? (
                     <select value={m.format} onChange={e => onSetMetricFormat(m.key, e.target.value)} style={{ fontFamily: SANS, fontSize: 11, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '2px 4px' }}>
                       <option value="number">#</option>
@@ -913,6 +1021,53 @@ function ConfigPanel(props) {
 
 const SUPPORTED_EXTS = ['csv', 'tsv', 'txt', 'json', 'xlsx', 'xls'];
 
+function ImportPreview({ pending, onSheet, onType, onName, onConfirm, onCancel }) {
+  const sheet = pending.sheets[pending.activeSheet];
+  const names = sheet.fields.map(field => (pending.names[field] || '').trim());
+  const hasDuplicateNames = new Set(names.map(name => name.toLowerCase())).size !== names.length;
+  const invalid = sheet.fields.map(field => {
+    const type = pending.types[field];
+    if (type !== 'number' && type !== 'date' && type !== 'date-dmy') return null;
+    const count = sheet.rows.filter(row => row[field] !== null && row[field] !== undefined && row[field] !== '' &&
+      (type === 'number' ? parseNumericValue(row[field]) : parseDateValue(row[field], type === 'date-dmy' ? 'dmy' : 'mdy')) === null).length;
+    return count ? `${field}: ${count} unparseable ${type} value${count === 1 ? '' : 's'}` : null;
+  }).filter(Boolean);
+  return (
+    <Panel style={{ border: `1.5px solid ${COLORS.accent}` }}>
+      <SectionHeader title="Review your import" subtitle={`${pending.name} · ${sheet.rows.length} rows · ${pending.activeSheet}`} />
+      {Object.keys(pending.sheets).length > 1 ? (
+        <label style={{ display: 'block', marginBottom: 16, fontSize: 12 }}>Sheet{' '}
+          <select value={pending.activeSheet} onChange={e => onSheet(e.target.value)}>
+            {Object.keys(pending.sheets).map(name => <option key={name} value={name}>{name}</option>)}
+          </select>
+        </label>
+      ) : null}
+      <p style={{ color: COLORS.muted, fontSize: 12 }}>Confirm column names and types before analysis. Formatted numbers such as $1,000 are converted; invalid values become blank and are counted below.</p>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+          <thead><tr><th style={{ textAlign: 'left' }}>Source column</th><th style={{ textAlign: 'left' }}>Use as</th><th style={{ textAlign: 'left' }}>Column name</th><th style={{ textAlign: 'left' }}>Sample values</th></tr></thead>
+          <tbody>{sheet.fields.map(field => (
+            <tr key={field} style={{ borderTop: `1px solid ${COLORS.border}` }}>
+              <td style={{ padding: '9px 8px' }}>{field}</td>
+              <td style={{ padding: '9px 8px' }}><select aria-label={`${field} type`} value={pending.types[field]} onChange={e => onType(field, e.target.value)}>
+                <option value="number">Number</option><option value="date">Date (month/day/year)</option><option value="date-dmy">Date (day/month/year)</option><option value="category">Category / text</option>
+              </select></td>
+              <td style={{ padding: '9px 8px' }}><input aria-label={`${field} column name`} value={pending.names[field]} onChange={e => onName(field, e.target.value)} /></td>
+              <td style={{ padding: '9px 8px', color: COLORS.muted }}>{sheet.rows.slice(0, 3).map(row => String(row[field] ?? '—')).join(' · ')}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      {invalid.length ? <p role="status" style={{ color: COLORS.amberText, fontSize: 12 }}>{invalid.join('; ')}</p> : null}
+      {hasDuplicateNames || names.some(name => !name) ? <p role="alert" style={{ color: COLORS.rose, fontSize: 12 }}>Column names must be unique and nonempty.</p> : null}
+      <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
+        <button onClick={onConfirm} disabled={hasDuplicateNames || names.some(name => !name)} style={{ background: COLORS.accent, color: '#fff', border: 0, borderRadius: 8, padding: '10px 16px', cursor: 'pointer' }}>Analyze data</button>
+        <button onClick={onCancel} style={{ background: '#fff', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: '10px 16px', cursor: 'pointer' }}>Cancel</button>
+      </div>
+    </Panel>
+  );
+}
+
 export default function FinalysisApp() {
   const [tab, setTab] = useState('dashboard');
   const [search, setSearch] = useState('');
@@ -921,6 +1076,7 @@ export default function FinalysisApp() {
   const [page, setPage] = useState(0);
 
   const [customDataset, setCustomDataset] = useState(null);
+  const [pendingImport, setPendingImport] = useState(null);
   const [configOpen, setConfigOpen] = useState(true);
   const [uploadError, setUploadError] = useState(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -985,7 +1141,7 @@ export default function FinalysisApp() {
 
   const genKpi = useMemo(() => {
     if (!customDataset) return { count: 0 };
-    const agg = aggregateMetrics(genFilteredRows, activeMetrics.map(m => m.key));
+    const agg = aggregateMetrics(genFilteredRows, activeMetrics);
     const ratioVals = {};
     activeRatios.forEach(rt => { ratioVals[rt.key] = computeRatio(genFilteredRows, rt); });
     return { ...agg, ...ratioVals };
@@ -1016,20 +1172,21 @@ export default function FinalysisApp() {
   // actually changes what you see everywhere else, instead of only the KPI cards.
   const genBreakdown = useMemo(() => {
     if (!customDataset || !genBreakdownDim) return [];
-    return groupByGeneric(genFilteredRows, genBreakdownDim, activeMetrics.map(m => m.key), activeRatios);
+    return groupByGeneric(genFilteredRows, genBreakdownDim, activeMetrics, activeRatios);
   }, [customDataset, genFilteredRows, genBreakdownDim, activeMetrics, activeRatios]);
 
   const genTrend = useMemo(() => {
     if (!customDataset || !dateField) return [];
-    return monthlyGroupGeneric(genFilteredRows, dateField, activeMetrics.map(m => m.key), activeRatios);
+    return monthlyGroupGeneric(genFilteredRows, dateField, activeMetrics, activeRatios);
   }, [customDataset, genFilteredRows, dateField, activeMetrics, activeRatios]);
 
   const genFirstDimAgg = useMemo(() => {
     if (!customDataset || !activeDimensions[0]) return [];
-    return groupByGeneric(genFilteredRows, activeDimensions[0].key, activeMetrics.map(m => m.key), activeRatios);
+    return groupByGeneric(genFilteredRows, activeDimensions[0].key, activeMetrics, activeRatios);
   }, [customDataset, genFilteredRows, activeDimensions, activeMetrics, activeRatios]);
 
   const genForecastBaseGrowth = useMemo(() => computeAvgGrowth(genTrend, genForecastMetric), [genTrend, genForecastMetric]);
+  const forecastBacktest = useMemo(() => backtestForecast(genTrend, genForecastMetric), [genTrend, genForecastMetric]);
   const genScenarioRates = {
     Base: genForecastBaseGrowth,
     Optimistic: genForecastBaseGrowth + Math.max(0.02, Math.abs(genForecastBaseGrowth) * 0.6),
@@ -1113,7 +1270,7 @@ export default function FinalysisApp() {
     if (!customDataset) return [];
     const out = [];
     activeDimensions.forEach(d => {
-      groupByGeneric(genFilteredRows, d.key, activeMetrics.map(m => m.key), activeRatios).forEach(g => out.push({ name: d.key + ': ' + g.name, ...g }));
+      groupByGeneric(genFilteredRows, d.key, activeMetrics, activeRatios).forEach(g => out.push({ name: d.key + ': ' + g.name, ...g }));
     });
     return out;
   }, [customDataset, genFilteredRows, activeDimensions, activeMetrics, activeRatios]);
@@ -1150,7 +1307,7 @@ export default function FinalysisApp() {
     const primary = activeMetrics[0];
     const breakdowns = activeDimensions.map(d => ({
       dimLabel: d.key,
-      groups: groupByGeneric(genFilteredRows, d.key, [primary.key], []).map(g => ({ name: g.name, value: g[primary.key], count: g.count })),
+      groups: groupByGeneric(genFilteredRows, d.key, [primary], []).map(g => ({ name: g.name, value: g[primary.key], count: g.count })),
     }));
     const trend = dateField && genTrend.length ? genTrend.map(t => ({ label: t.label, value: t[primary.key] })) : [];
     const ratio = (activeRatios[0] && activeDimensions[0])
@@ -1208,10 +1365,11 @@ export default function FinalysisApp() {
   // participates if the exact same key exists in dataset B's raw fields — no
   // fuzzy matching, so what's compared is always auditable from the column
   // names alone. Ratios need BOTH underlying columns present in B.
-  const fileCompareMatchedMetrics = fileCompareDataset ? activeMetrics.filter(m => fileCompareDataset.fields.includes(m.key)) : [];
-  const fileCompareUnmatchedMetrics = fileCompareDataset ? activeMetrics.filter(m => !fileCompareDataset.fields.includes(m.key)) : [];
-  const fileCompareMatchedRatios = fileCompareDataset ? activeRatios.filter(r => fileCompareDataset.fields.includes(r.num) && fileCompareDataset.fields.includes(r.den)) : [];
-  const fileCompareUnmatchedRatios = fileCompareDataset ? activeRatios.filter(r => !(fileCompareDataset.fields.includes(r.num) && fileCompareDataset.fields.includes(r.den))) : [];
+  const comparableNumeric = new Set(fileCompareDataset ? fileCompareDataset.schema.filter(col => col.type === 'number').map(col => col.key) : []);
+  const fileCompareMatchedMetrics = fileCompareDataset ? activeMetrics.filter(m => comparableNumeric.has(m.key)) : [];
+  const fileCompareUnmatchedMetrics = fileCompareDataset ? activeMetrics.filter(m => !comparableNumeric.has(m.key)) : [];
+  const fileCompareMatchedRatios = fileCompareDataset ? activeRatios.filter(r => comparableNumeric.has(r.num) && comparableNumeric.has(r.den)) : [];
+  const fileCompareUnmatchedRatios = fileCompareDataset ? activeRatios.filter(r => !(comparableNumeric.has(r.num) && comparableNumeric.has(r.den))) : [];
   const fileCompareMatchedDimensions = fileCompareDataset ? activeDimensions.filter(d => fileCompareDataset.fields.includes(d.key)) : [];
   const fileCompareUnmatchedDimensions = fileCompareDataset ? activeDimensions.filter(d => !fileCompareDataset.fields.includes(d.key)) : [];
   const fileCompareMatchedMetricKeys = fileCompareMatchedMetrics.map(m => m.key).join('|');
@@ -1220,14 +1378,14 @@ export default function FinalysisApp() {
 
   const fileCompareTotalsA = useMemo(() => {
     if (!customDataset) return null;
-    const agg = aggregateMetrics(customDataset.rows, fileCompareMatchedMetrics.map(m => m.key));
+    const agg = aggregateMetrics(customDataset.rows, fileCompareMatchedMetrics);
     fileCompareMatchedRatios.forEach(rt => { agg[rt.key] = computeRatio(customDataset.rows, rt); });
     return agg;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [customDataset, fileCompareMatchedMetricKeys, fileCompareMatchedRatioKeys]);
   const fileCompareTotalsB = useMemo(() => {
     if (!fileCompareDataset) return null;
-    const agg = aggregateMetrics(fileCompareDataset.rows, fileCompareMatchedMetrics.map(m => m.key));
+    const agg = aggregateMetrics(fileCompareDataset.rows, fileCompareMatchedMetrics);
     fileCompareMatchedRatios.forEach(rt => { agg[rt.key] = computeRatio(fileCompareDataset.rows, rt); });
     return agg;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1237,8 +1395,8 @@ export default function FinalysisApp() {
 
   const fileCompareSegmentTable = useMemo(() => {
     if (!customDataset || !fileCompareDataset || !fileCompareBreakdownDim) return [];
-    const groupA = groupByGeneric(customDataset.rows, fileCompareBreakdownDim, fileCompareMatchedMetrics.map(m => m.key), fileCompareMatchedRatios);
-    const groupB = groupByGeneric(fileCompareDataset.rows, fileCompareBreakdownDim, fileCompareMatchedMetrics.map(m => m.key), fileCompareMatchedRatios);
+    const groupA = groupByGeneric(customDataset.rows, fileCompareBreakdownDim, fileCompareMatchedMetrics, fileCompareMatchedRatios);
+    const groupB = groupByGeneric(fileCompareDataset.rows, fileCompareBreakdownDim, fileCompareMatchedMetrics, fileCompareMatchedRatios);
     const byNameA = Object.fromEntries(groupA.map(g => [g.name, g]));
     const byNameB = Object.fromEntries(groupB.map(g => [g.name, g]));
     const names = Array.from(new Set([...groupA.map(g => g.name), ...groupB.map(g => g.name)])).sort();
@@ -1558,7 +1716,7 @@ export default function FinalysisApp() {
     const numberCols = schema.filter(s => s.type === 'number');
     const categoryCols = schema.filter(s => s.type === 'category' || s.type === 'text');
     if (!numberCols.length) { setUploadError('No numeric columns detected in "' + activeSheetName + '" — nothing to total or chart. Check the file has at least one numeric column.'); return; }
-    const metrics = numberCols.map((s, i) => ({ key: s.key, on: i < 6, format: guessMetricFormat(s.key) }));
+    const metrics = numberCols.map((s, i) => ({ key: s.key, on: i < 6, format: guessMetricFormat(s.key), aggregation: 'sum' }));
     const dimensions = categoryCols.map((s, i) => ({ key: s.key, on: (s.unique >= 2 && s.unique <= 25 && i < 4), unique: s.unique }));
     const dateCandidate = schema.find(s => s.type === 'date');
     // Auto-suggest a "Profit" calculated metric when the shape of the data makes it
@@ -1630,7 +1788,7 @@ export default function FinalysisApp() {
           wb.SheetNames.forEach(name => {
             const json = XLSX.utils.sheet_to_json(wb.Sheets[name], { defval: null, raw: true });
             if (json.length) {
-              const fields = Object.keys(json[0]);
+               const fields = Array.from(new Set(json.flatMap(row => Object.keys(row))));
               const rows = json.map(r => {
                 const o = {};
                 fields.forEach(f => { let v = r[f]; if (v instanceof Date) v = v.toISOString().slice(0, 10); o[f] = v; });
@@ -1674,6 +1832,11 @@ export default function FinalysisApp() {
         Papa.parse(text, {
           header: true, dynamicTyping: true, skipEmptyLines: true, delimiter: ext === 'tsv' ? '\t' : '',
           complete: (results) => {
+            if (results.errors && results.errors.length) {
+              const first = results.errors[0];
+              onError(`CSV parse error on row ${first.row ?? '?'}: ${first.message}`);
+              return;
+            }
             const fields = results.meta.fields || [];
             const rows = (results.data || []).filter(r => fields.some(f => r[f] !== null && r[f] !== undefined && r[f] !== ''));
             if (!fields.length || !rows.length) { onError('Could not find columns or rows in that file — make sure it has a header row.'); return; }
@@ -1685,10 +1848,32 @@ export default function FinalysisApp() {
       reader.readAsText(file);
     }
   }
+  function importOptions(sheet) {
+    const schema = detectSchema(sheet.rows, sheet.fields);
+    return {
+      types: Object.fromEntries(schema.map(col => [col.key, col.type === 'number' || col.type === 'date' ? col.type : 'category'])),
+      names: Object.fromEntries(sheet.fields.map(field => [field, field])),
+    };
+  }
+  function stageImport(fileName, sheets, activeSheet) {
+    setPendingImport({ name: fileName, sheets, activeSheet, ...importOptions(sheets[activeSheet]) });
+    setTab('dashboard');
+  }
+  function confirmImport() {
+    if (!pendingImport) return;
+    const { name, sheets, activeSheet, types, names } = pendingImport;
+    const source = sheets[activeSheet];
+    const renamedFields = source.fields.map(field => names[field].trim());
+    if (renamedFields.some(field => !field) || new Set(renamedFields.map(field => field.toLowerCase())).size !== renamedFields.length) return;
+    const normalized = normalizeRows(source.rows, types).map(row => Object.fromEntries(source.fields.map(field => [names[field].trim(), row[field]])));
+    const normalizedSheets = { ...sheets, [activeSheet]: { fields: renamedFields, rows: normalized } };
+    finalizeDataset(name, normalizedSheets, activeSheet);
+    setPendingImport(null);
+  }
   function handleFile(file) {
     if (!file) return;
     setUploadError(null);
-    parseFileGeneric(file, finalizeDataset, setUploadError);
+    parseFileGeneric(file, stageImport, setUploadError);
   }
   function onDrop(e) { e.preventDefault(); setIsDragOver(false); const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) handleFile(f); }
   function onDragOver(e) { e.preventDefault(); setIsDragOver(true); }
@@ -1704,7 +1889,8 @@ export default function FinalysisApp() {
     parseFileGeneric(file, (fileName, sheetsMap, activeSheetName) => {
       const { fields, rows } = sheetsMap[activeSheetName];
       const schema = detectSchema(rows, fields);
-      setCompareDataset({ name: fileName, rows, fields, schema });
+      const types = Object.fromEntries(schema.map(col => [col.key, col.type]));
+      setCompareDataset({ name: fileName, rows: normalizeRows(rows, types), fields, schema });
     }, setCompareUploadError);
   }
   function removeFileCompareDataset() { setCompareDataset(null); setCompareUploadError(null); }
@@ -1714,6 +1900,7 @@ export default function FinalysisApp() {
 
   function toggleMetric(key) { setCustomDataset(ds => ({ ...ds, config: { ...ds.config, metrics: ds.config.metrics.map(m => m.key === key ? { ...m, on: !m.on } : m) } })); }
   function setMetricFormat(key, format) { setCustomDataset(ds => ({ ...ds, config: { ...ds.config, metrics: ds.config.metrics.map(m => m.key === key ? { ...m, format } : m) } })); }
+  function setAggregation(key, aggregation) { setCustomDataset(ds => ({ ...ds, config: { ...ds.config, metrics: ds.config.metrics.map(m => m.key === key ? { ...m, aggregation } : m) } })); }
   function toggleDimension(key) { setCustomDataset(ds => ({ ...ds, config: { ...ds.config, dimensions: ds.config.dimensions.map(d => d.key === key ? { ...d, on: !d.on } : d) } })); }
   function setDateField(key) { setCustomDataset(ds => ({ ...ds, config: { ...ds.config, dateField: key } })); }
   function addRatio() {
@@ -1834,7 +2021,11 @@ export default function FinalysisApp() {
 
           {tab === 'dashboard' && (
             <div>
-              {!customDataset ? (
+              {pendingImport ? <ImportPreview pending={pendingImport}
+                onSheet={name => setPendingImport(p => ({ ...p, activeSheet: name, ...importOptions(p.sheets[name]) }))}
+                onType={(field, type) => setPendingImport(p => ({ ...p, types: { ...p.types, [field]: type } }))}
+                onName={(field, name) => setPendingImport(p => ({ ...p, names: { ...p.names, [field]: name } }))}
+                onConfirm={confirmImport} onCancel={() => setPendingImport(null)} /> : !customDataset ? (
                 <div>
                   <SectionHeader title="Welcome to MBU Finalysis" subtitle="Upload any spreadsheet or export and get a full financial analysis workspace in seconds." />
                   <Panel style={{ textAlign: 'center', padding: '56px 24px', background: `linear-gradient(180deg, ${COLORS.ink} 0%, ${COLORS.inkLight} 100%)`, border: 'none' }}>
@@ -1843,7 +2034,7 @@ export default function FinalysisApp() {
                     </div>
                     <div style={{ fontFamily: SANS, fontWeight: 700, fontSize: 19, color: '#FFFFFF', marginBottom: 8 }}>Upload your data to get started</div>
                     <div style={{ fontFamily: SANS, fontSize: 13, color: '#9098B8', maxWidth: 440, margin: '0 auto 22px auto', lineHeight: 1.5 }}>
-                      Any domain, any shape. We auto-detect your metrics, categories and dates, then build filterable dashboards, forecasts, and AI-written insights automatically.
+                      Upload a file, review its columns, and build filterable dashboards, forecasts, and offline insights from your data.
                     </div>
                     <button onClick={() => fileInputRef.current && fileInputRef.current.click()}
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontFamily: SANS, fontSize: 13.5, fontWeight: 700, color: COLORS.ink, background: `linear-gradient(135deg, ${COLORS.cyan}, ${COLORS.accent})`, border: 'none', borderRadius: 10, padding: '12px 22px', cursor: 'pointer' }}>
@@ -1870,7 +2061,7 @@ export default function FinalysisApp() {
                   <SectionHeader title="Portfolio Dashboard" subtitle={customDataset.name + ' — ' + customDataset.rows.length + ' rows, auto-detected on upload. Adjust below any time.'} />
                   <ConfigPanel dataset={customDataset} open={configOpen} onToggleOpen={() => setConfigOpen(o => !o)}
                     onSwitchSheet={switchSheet}
-                    onToggleMetric={toggleMetric} onSetMetricFormat={setMetricFormat} onToggleDimension={toggleDimension}
+                    onToggleMetric={toggleMetric} onSetMetricFormat={setMetricFormat} onSetAggregation={setAggregation} onToggleDimension={toggleDimension}
                     onSetDateField={setDateField} onAddRatio={addRatio} onUpdateRatio={updateRatio} onRemoveRatio={removeRatio}
                     onSaveConfig={handleSaveConfig} onForgetConfig={handleForgetConfig} saveStatus={saveStatus} savedConfigApplied={savedConfigApplied}
                     onAddBudgetPair={addBudgetPair} onUpdateBudgetPair={updateBudgetPair} onRemoveBudgetPair={removeBudgetPair} />
@@ -2626,6 +2817,14 @@ export default function FinalysisApp() {
                     <KpiCard label={genForecast.length ? genForecast[genForecast.length - 1].label + ' projected' : 'Projected'} value={genForecast.length ? fmtByFormat(genForecast[genForecast.length - 1].value, activeMetricFormat(genForecastMetric)) : '—'} accent={COLORS.emerald} />
                     <KpiCard label="Monthly growth applied" value={fmtPct(genActiveGrowth, 2)} accent={COLORS.amberText} />
                   </div>
+                  <Panel style={{ marginBottom: 16, background: COLORS.accentSoft }}>
+                    <div style={{ fontFamily: SANS, fontSize: 12.5, fontWeight: 700, color: COLORS.ink }}>Forecast reality check</div>
+                    <div style={{ fontFamily: SANS, fontSize: 12, color: COLORS.muted, marginTop: 5 }}>
+                      {forecastBacktest && forecastBacktest.samples >= 3
+                        ? `One-month backtest: ${fmtPct(forecastBacktest.meanAbsolutePercentError, 1)} average absolute error across ${forecastBacktest.samples} past predictions. Scenarios are illustrations, not guarantees.`
+                        : 'Too few consecutive positive monthly observations to estimate forecast error. Treat these scenarios as illustrations.'}
+                    </div>
+                  </Panel>
                   <Panel style={{ marginBottom: 16 }}>
                     <div style={{ fontFamily: SANS, fontSize: 13, fontWeight: 600, color: COLORS.ink, marginBottom: 12 }}>Forecast — {genForecastMetric} ({genScenario})</div>
                     <div style={{ height: 240 }}>
@@ -2874,7 +3073,7 @@ export default function FinalysisApp() {
                         <div style={{ display: 'flex', gap: 10, marginBottom: 16, padding: '10px 14px', background: '#FFF8EB', border: `1px solid ${COLORS.amber}`, borderRadius: 10 }}>
                           <AlertTriangle size={15} color={COLORS.amberText} style={{ flexShrink: 0, marginTop: 1 }} />
                           <div style={{ fontFamily: SANS, fontSize: 12, color: '#6B4A16', lineHeight: 1.5 }}>
-                            <strong>Not compared — column name not found in {fileCompareDataset.name}: </strong>
+                            <strong>Not compared — matching usable column not found in {fileCompareDataset.name}: </strong>
                             {[...fileCompareUnmatchedMetrics.map(m => m.key), ...fileCompareUnmatchedRatios.map(r => r.label + ' (needs ' + r.num + ' & ' + r.den + ')'), ...fileCompareUnmatchedDimensions.map(d => d.key)].join(', ')}
                           </div>
                         </div>

@@ -6,22 +6,21 @@
   "description": "Domain-agnostic, browser-based financial/data analytics workspace — upload any spreadsheet and get dashboards, forecasts, drill-through, and comparisons automatically.",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "build:css": "tailwindcss -i ./src/tw.css -o ./src/tw-built.css --minify"
+    "build": "vite build && node scripts/inline-build.mjs",
+    "test": "node --test tests/*.test.cjs",
+    "preview": "vite preview"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^4.7.0",
     "lucide-react": "^0.400.0",
     "papaparse": "^5.7.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^2.15.4",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
-    "tailwindcss": "^3.4.19",
-    "vite": "^5.4.21",
-    "vite-plugin-singlefile": "^2.3.3"
+    "@vitejs/plugin-react": "^6.1.2",
+    "esbuild": "^0.28.2",
+    "vite": "^8.3.4"
   }
 }
