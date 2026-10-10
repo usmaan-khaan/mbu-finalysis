@@ -56,3 +56,63 @@ test('CSV exports neutralize spreadsheet formulas and saved setup keys do not tr
   assert.match(app.rowsToCSV(['name'], [{ name: '=HYPERLINK("https://example.com","click")' }]), /'=/);
   assert.notEqual(app.schemaSignature(['a'.repeat(151) + 'x']), app.schemaSignature(['a'.repeat(151) + 'y']));
 });
+
+test('reviewed categories override detection for numeric IDs and date-looking text', () => {
+  const sheet = app.prepareImportSheet({
+    fields: ['id', 'label', 'amount'],
+    rows: [{ id: 1001, label: '2026-01-01', amount: '$10' }, { id: 1002, label: '2026-02-01', amount: '$20' }],
+  }, { id: 'category', label: 'category', amount: 'number' }, { id: 'Customer ID', label: 'label', amount: 'amount' });
+  assert.deepEqual(sheet.schema.map(col => [col.key, col.type]), [['Customer ID', 'category'], ['label', 'category'], ['amount', 'number']]);
+  assert.equal(sheet.rows[0]['Customer ID'], 1001);
+  assert.equal(sheet.rows[0].label, '2026-01-01');
+  assert.equal(sheet.rows[0].amount, 10);
+  assert.throws(() => app.prepareImportSheet({ fields: ['a', 'b'], rows: [{ a: 1, b: 2 }] }, { a: 'number', b: 'number' }, { a: 'Same', b: 'same' }), /unique/);
+});
+
+test('invalid dates remain diagnosable after normalization, renaming, and day-first review', () => {
+  const sheet = app.prepareImportSheet({
+    fields: ['date', 'amount'],
+    rows: [{ date: '13/10/2026', amount: 10 }, { date: '31/02/2026', amount: 20 }, { date: '', amount: 30 }],
+  }, { date: 'date-dmy', amount: 'number' }, { date: 'Transaction date', amount: 'amount' });
+  assert.equal(sheet.rows[0]['Transaction date'], '2026-10-13');
+  assert.equal(sheet.rows[1]['Transaction date'], null);
+  const quality = app.computeDataQuality(sheet.rows, sheet.fields, 'Transaction date', sheet.sourceRows, sheet.columnTypes);
+  assert.equal(quality.badDateCount, 1);
+  assert.equal(quality.nullStats.find(col => col.field === 'Transaction date').nulls, 2);
+});
+
+test('reviewed numeric and date columns retain their types even with no valid values', () => {
+  const sheet = app.prepareImportSheet({ fields: ['date', 'amount'], rows: [{ date: 'bad', amount: 'N/A' }] },
+    { date: 'date', amount: 'number' }, { date: 'date', amount: 'amount' });
+  assert.deepEqual(sheet.schema.map(col => col.type), ['date', 'number']);
+  assert.deepEqual(sheet.rows, [{ date: null, amount: null }]);
+});
+
+test('single-column CSVs import but malformed records still fail', () => {
+  assert.deepEqual(app.parseDelimitedText('sales\n10\n20'), { fields: ['sales'], rows: [{ sales: 10 }, { sales: 20 }] });
+  assert.deepEqual(app.parseDelimitedText('sales\n10\n20', '\t').rows, [{ sales: 10 }, { sales: 20 }]);
+  assert.deepEqual(app.parseDelimitedText('segment\tsales\nx\t10', '\t').rows, [{ segment: 'x', sales: 10 }]);
+  assert.throws(() => app.parseDelimitedText('segment,sales\nx,10,extra'), /CSV parse error/);
+  assert.throws(() => app.parseDelimitedText('segment,sales\nx'), /CSV parse error/);
+  assert.throws(() => app.parseDelimitedText('segment,sales\n"unterminated,10'), /CSV parse error/);
+  assert.throws(() => app.parseDelimitedText('sales'), /Could not find columns or rows/);
+});
+
+test('minimum, maximum, and count exclude blank and invalid values', () => {
+  const rows = [{ value: 10 }, { value: -5 }, { value: null }, { value: 'N/A' }];
+  assert.equal(app.aggregateMetrics(rows, [{ key: 'value', aggregation: 'min' }]).value, -5);
+  assert.equal(app.aggregateMetrics(rows, [{ key: 'value', aggregation: 'max' }]).value, 10);
+  assert.equal(app.aggregateMetrics(rows, [{ key: 'value', aggregation: 'count' }]).value, 2);
+});
+
+test('saved setups cannot undo reviewed types and keep compatible budget preferences', () => {
+  const config = { metrics: [{ key: 'sales', aggregation: 'sum', on: true }, { key: 'budget', on: true }], dimensions: [{ key: 'id', on: true }], dateField: 'date', ratios: [], budgetPairs: [] };
+  const saved = { metrics: [{ key: 'id', on: true }, { key: 'sales', aggregation: 'average', on: true }], dimensions: [], dateField: 'id', ratios: [{ key: 'bad', num: 'id', den: 'sales' }, { key: 'good', num: 'sales', den: 'budget' }], budgetPairs: [{ key: 'pair', actual: 'sales', budget: 'budget' }] };
+  const restored = app.reconcileSavedConfig(config, saved, [{ key: 'date', type: 'date' }, { key: 'id', type: 'category' }]);
+  assert.deepEqual(restored.metrics.map(metric => metric.key), ['sales', 'budget']);
+  assert.equal(restored.metrics[0].aggregation, 'average');
+  assert.equal(restored.dimensions[0].key, 'id');
+  assert.equal(restored.dateField, 'date');
+  assert.deepEqual(restored.ratios.map(ratio => ratio.key), ['good']);
+  assert.deepEqual(restored.budgetPairs, saved.budgetPairs);
+});

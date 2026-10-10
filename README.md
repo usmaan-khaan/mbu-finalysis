@@ -44,7 +44,15 @@ Open the printed local URL and drop in a CSV, TSV, JSON, or Excel (`.xlsx`/`.xls
 npm run build
 ```
 
-Run the calculation regression tests with `npm test`. The GitHub Pages workflow runs tests before building.
+Run the calculation and import regression tests with `npm test`. To test the production HTML in Chromium:
+
+```bash
+npx playwright install chromium
+npm run build
+npm run test:browser
+```
+
+Browser tests cover the hosted build and the standalone `dist/index.html`, reviewed column types, invalid-date diagnostics, workbook sheet changes, and comparison aggregation changes. They fail on browser errors or unexpected external requests. The GitHub Pages workflow runs calculation tests, builds, and runs browser tests on pushes and pull requests; only successful main-branch builds deploy.
 
 This produces a single self-contained `dist/index.html`; the build script inlines Vite's generated script and stylesheet. You can drop that file on GitHub Pages, a static file host, or open it locally.
 

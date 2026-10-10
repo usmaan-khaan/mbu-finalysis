@@ -146,6 +146,48 @@ export function normalizeRows(rows, columnTypes) {
   })));
 }
 
+// Keep reviewed types authoritative and retain source values for quality diagnostics.
+export function prepareImportSheet(sheet, types, names) {
+  const fields = sheet.fields.map(field => (names[field] || '').trim());
+  if (fields.some(field => !field) || new Set(fields.map(field => field.toLowerCase())).size !== fields.length) {
+    throw new Error('Column names must be unique and nonempty.');
+  }
+  const renameRows = rows => rows.map(row => Object.fromEntries(sheet.fields.map((field, i) => [fields[i], row[field]])));
+  const rows = renameRows(normalizeRows(sheet.rows, types));
+  const sourceRows = renameRows(sheet.sourceRows || sheet.rows);
+  const columnTypes = Object.fromEntries(sheet.fields.map((field, i) => [fields[i], types[field]]));
+  const schema = detectSchema(rows, fields).map(col => ({
+    ...col, type: columnTypes[col.key] === 'date-dmy' ? 'date' : columnTypes[col.key],
+  }));
+  return { fields, rows, sourceRows, columnTypes, schema };
+}
+
+// Saved preferences may be restored only for columns compatible with this review.
+export function reconcileSavedConfig(config, saved, schema) {
+  const numeric = new Set(config.metrics.map(metric => metric.key));
+  const ratios = (saved.ratios || []).filter(ratio => numeric.has(ratio.num) && numeric.has(ratio.den));
+  const available = new Set([...numeric, ...ratios.map(ratio => ratio.key)]);
+  return {
+    ...config,
+    metrics: config.metrics.map(metric => ({ ...metric, ...(saved.metrics || []).find(item => item.key === metric.key) })),
+    dimensions: config.dimensions.map(dimension => ({ ...dimension, ...(saved.dimensions || []).find(item => item.key === dimension.key) })),
+    dateField: saved.dateField === '' || schema.some(col => col.key === saved.dateField && col.type === 'date') ? saved.dateField : config.dateField,
+    ratios,
+    budgetPairs: (saved.budgetPairs || []).filter(pair => available.has(pair.actual) && available.has(pair.budget)),
+  };
+}
+
+export function parseDelimitedText(text, delimiter = '') {
+  const results = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true, delimiter });
+  // A single-column file needs no delimiter; PapaParse still reports a fallback warning.
+  const fatal = results.errors.find(error => error.code !== 'UndetectableDelimiter');
+  if (fatal) throw new Error(`CSV parse error on row ${fatal.row ?? '?'}: ${fatal.message}`);
+  const fields = results.meta.fields || [];
+  const rows = (results.data || []).filter(row => fields.some(field => row[field] !== null && row[field] !== undefined && row[field] !== ''));
+  if (!fields.length || !rows.length) throw new Error('Could not find columns or rows in that file — make sure it has a header row.');
+  return { fields, rows };
+}
+
 // Classify each column as number / date / category / text(high-cardinality, excluded by default)
 export function detectSchema(rows, fields) {
   return fields.map(f => {
@@ -534,7 +576,7 @@ export function computeVariance(actualVal, budgetVal) {
 }
 
 /* ===================== Data quality diagnostics ===================== */
-export function computeDataQuality(rows, fields, dateField) {
+export function computeDataQuality(rows, fields, dateField, sourceRows = rows, columnTypes = {}) {
   const total = rows.length;
   const nullStats = fields.map(f => {
     const nulls = rows.filter(r => r[f] === null || r[f] === undefined || r[f] === '').length;
@@ -551,10 +593,10 @@ export function computeDataQuality(rows, fields, dateField) {
 
   let badDateCount = 0;
   if (dateField) {
-    badDateCount = rows.filter(r => {
+    badDateCount = sourceRows.filter(r => {
       const v = r[dateField];
       if (v === null || v === undefined || v === '') return false;
-      return parseDateValue(v) === null;
+      return parseDateValue(v, columnTypes[dateField] === 'date-dmy' ? 'dmy' : 'mdy') === null;
     }).length;
   }
 
@@ -1158,7 +1200,7 @@ export default function FinalysisApp() {
 
   const dataQuality = useMemo(() => {
     if (!customDataset) return null;
-    return computeDataQuality(customDataset.rows, customDataset.fields, dateField);
+    return computeDataQuality(customDataset.rows, customDataset.fields, dateField, customDataset.sourceRows, customDataset.columnTypes);
   }, [customDataset, dateField]);
 
   const negativeCounts = useMemo(() => {
@@ -1372,8 +1414,8 @@ export default function FinalysisApp() {
   const fileCompareUnmatchedRatios = fileCompareDataset ? activeRatios.filter(r => !(comparableNumeric.has(r.num) && comparableNumeric.has(r.den))) : [];
   const fileCompareMatchedDimensions = fileCompareDataset ? activeDimensions.filter(d => fileCompareDataset.fields.includes(d.key)) : [];
   const fileCompareUnmatchedDimensions = fileCompareDataset ? activeDimensions.filter(d => !fileCompareDataset.fields.includes(d.key)) : [];
-  const fileCompareMatchedMetricKeys = fileCompareMatchedMetrics.map(m => m.key).join('|');
-  const fileCompareMatchedRatioKeys = fileCompareMatchedRatios.map(r => r.key).join('|');
+  const fileCompareMatchedMetricKeys = JSON.stringify(fileCompareMatchedMetrics.map(m => [m.key, m.aggregation || 'sum']));
+  const fileCompareMatchedRatioKeys = JSON.stringify(fileCompareMatchedRatios.map(r => [r.key, r.num, r.den, r.op || '÷']));
   const fileCompareMatchedDimKeys = fileCompareMatchedDimensions.map(d => d.key).join('|');
 
   const fileCompareTotalsA = useMemo(() => {
@@ -1712,7 +1754,7 @@ export default function FinalysisApp() {
     const sheet = sheetsMap[activeSheetName];
     if (!sheet || !sheet.fields.length || !sheet.rows.length) { setUploadError('"' + activeSheetName + '" has no usable rows or columns.'); return; }
     const { fields, rows } = sheet;
-    const schema = detectSchema(rows, fields);
+    const schema = sheet.schema || detectSchema(rows, fields);
     const numberCols = schema.filter(s => s.type === 'number');
     const categoryCols = schema.filter(s => s.type === 'category' || s.type === 'text');
     if (!numberCols.length) { setUploadError('No numeric columns detected in "' + activeSheetName + '" — nothing to total or chart. Check the file has at least one numeric column.'); return; }
@@ -1731,7 +1773,7 @@ export default function FinalysisApp() {
       autoRatios.push({ key: 'calc_profit_auto', label: 'Profit', num: revenueCol.key, den: costCol.key, op: '−', format: 'currency' });
     }
     const config = { metrics, dimensions, dateField: dateCandidate ? dateCandidate.key : '', ratios: autoRatios, budgetPairs: [] };
-    setCustomDataset({ name: fileName, rows, fields, schema, config, sheets: sheetsMap, activeSheet: activeSheetName });
+    setCustomDataset({ name: fileName, rows, fields, schema, sourceRows: sheet.sourceRows, columnTypes: sheet.columnTypes, config, sheets: sheetsMap, activeSheet: activeSheetName });
     setTab('dashboard');
     setConfigOpen(true);
     setGenFilters({});
@@ -1751,19 +1793,23 @@ export default function FinalysisApp() {
     setCompareDataset(null); setCompareUploadError(null); setCompareBreakdownDim('');
     loadSavedConfig(fields).then(saved => {
       if (!saved) return;
-      setCustomDataset(ds => (ds && ds.name === fileName && ds.activeSheet === activeSheetName) ? { ...ds, config: saved } : ds);
+      const restored = reconcileSavedConfig(config, saved, schema);
+      setCustomDataset(ds => (ds && ds.name === fileName && ds.activeSheet === activeSheetName) ? { ...ds, config: restored } : ds);
       setSavedConfigApplied(true);
-      const savedDim = (saved.dimensions || []).find(d => d.on);
-      const savedMetric = (saved.metrics || []).find(m => m.on);
+      const savedDim = restored.dimensions.find(d => d.on);
+      const savedMetric = restored.metrics.find(m => m.on);
       if (savedDim) setGenBreakdownDim(savedDim.key);
       if (savedMetric) setGenForecastMetric(savedMetric.key);
     }).catch(() => {});
     loadSavedViews(fields).then(views => setSavedViews(views || [])).catch(() => {});
+    return true;
   }
 
   function switchSheet(name) {
     if (!customDataset || !customDataset.sheets || !customDataset.sheets[name]) return;
-    finalizeDataset(customDataset.name, customDataset.sheets, name);
+    const sheet = customDataset.sheets[name];
+    if (sheet.schema) finalizeDataset(customDataset.name, customDataset.sheets, name);
+    else stageImport(customDataset.name, customDataset.sheets, name);
   }
 
   // Shared file->rows parsing for CSV/TSV/JSON/Excel, factored out so the
@@ -1829,21 +1875,12 @@ export default function FinalysisApp() {
     } else {
       reader.onload = (e) => {
         const text = e.target.result;
-        Papa.parse(text, {
-          header: true, dynamicTyping: true, skipEmptyLines: true, delimiter: ext === 'tsv' ? '\t' : '',
-          complete: (results) => {
-            if (results.errors && results.errors.length) {
-              const first = results.errors[0];
-              onError(`CSV parse error on row ${first.row ?? '?'}: ${first.message}`);
-              return;
-            }
-            const fields = results.meta.fields || [];
-            const rows = (results.data || []).filter(r => fields.some(f => r[f] !== null && r[f] !== undefined && r[f] !== ''));
-            if (!fields.length || !rows.length) { onError('Could not find columns or rows in that file — make sure it has a header row.'); return; }
-            onSuccess(file.name, { 'Sheet1': { fields, rows } }, 'Sheet1');
-          },
-          error: (err) => onError('Could not parse that file: ' + err.message),
-        });
+        try {
+          const sheet = parseDelimitedText(text, ext === 'tsv' ? '\t' : '');
+          onSuccess(file.name, { Sheet1: sheet }, 'Sheet1');
+        } catch (err) {
+          onError(err.message || 'Could not parse that file.');
+        }
       };
       reader.readAsText(file);
     }
@@ -1865,10 +1902,12 @@ export default function FinalysisApp() {
     const source = sheets[activeSheet];
     const renamedFields = source.fields.map(field => names[field].trim());
     if (renamedFields.some(field => !field) || new Set(renamedFields.map(field => field.toLowerCase())).size !== renamedFields.length) return;
-    const normalized = normalizeRows(source.rows, types).map(row => Object.fromEntries(source.fields.map(field => [names[field].trim(), row[field]])));
-    const normalizedSheets = { ...sheets, [activeSheet]: { fields: renamedFields, rows: normalized } };
-    finalizeDataset(name, normalizedSheets, activeSheet);
-    setPendingImport(null);
+    try {
+      const normalizedSheets = { ...sheets, [activeSheet]: prepareImportSheet(source, types, names) };
+      if (finalizeDataset(name, normalizedSheets, activeSheet)) setPendingImport(null);
+    } catch (err) {
+      setUploadError(err.message || 'Could not prepare that import.');
+    }
   }
   function handleFile(file) {
     if (!file) return;
@@ -2454,7 +2493,7 @@ export default function FinalysisApp() {
                           <div style={{ fontFamily: SANS, fontSize: 11, color: COLORS.muted }}>columns with gaps</div>
                         </div>
                         <div>
-                          <div style={{ fontFamily: MONO, fontSize: 20, fontWeight: 700, color: dataQuality.badDateCount > 0 ? COLORS.rose : COLORS.emerald }}>{dataQuality.badDateCount}</div>
+                          <div data-testid="unparseable-date-count" style={{ fontFamily: MONO, fontSize: 20, fontWeight: 700, color: dataQuality.badDateCount > 0 ? COLORS.rose : COLORS.emerald }}>{dataQuality.badDateCount}</div>
                           <div style={{ fontFamily: SANS, fontSize: 11, color: COLORS.muted }}>unparseable dates</div>
                         </div>
                       </div>
@@ -3094,11 +3133,11 @@ export default function FinalysisApp() {
                                   <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
                                     <div>
                                       <div style={{ fontFamily: SANS, fontSize: 10, color: COLORS.muted, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 120 }}>{customDataset.name}</div>
-                                      <div style={{ fontFamily: MONO, fontSize: 18, fontWeight: 600, color: COLORS.ink }}>{fmtByFormat(va, m.format)}</div>
+                                      <div data-testid={`compare-a-${m.key}`} style={{ fontFamily: MONO, fontSize: 18, fontWeight: 600, color: COLORS.ink }}>{fmtByFormat(va, m.format)}</div>
                                     </div>
                                     <div style={{ textAlign: 'right' }}>
                                       <div style={{ fontFamily: SANS, fontSize: 10, color: COLORS.muted, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 120 }}>{fileCompareDataset.name}</div>
-                                      <div style={{ fontFamily: MONO, fontSize: 18, fontWeight: 600, color: COLORS.accent }}>{fmtByFormat(vb, m.format)}</div>
+                                      <div data-testid={`compare-b-${m.key}`} style={{ fontFamily: MONO, fontSize: 18, fontWeight: 600, color: COLORS.accent }}>{fmtByFormat(vb, m.format)}</div>
                                     </div>
                                   </div>
                                   <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}><DeltaBadge pct={pct} size={12} /></div>
